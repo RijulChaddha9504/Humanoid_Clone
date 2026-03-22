@@ -18,6 +18,8 @@ WATO_HAND_JOINT_NAMES = [
 def mediapipe_to_openxr(landmarks):
     """Convert 21 MediaPipe landmarks to OpenXR-style pose dict."""
     mp = np.array([[lm["x"], lm["y"], lm["z"]] for lm in landmarks])
+    wrist = mp[0].copy()      # ADD THIS
+    mp = mp - wrist 
 
     hand_poses = {}
 
@@ -49,9 +51,8 @@ def mediapipe_to_openxr(landmarks):
     hand_poses[25] = mp[20].copy()  # pinky tip
 
     # Wrist quaternion (identity since MediaPipe is already wrist-relative)
-    wrist_xyz = mp[0]
     hand_poses["wrist"] = np.array(
-        [wrist_xyz[0], wrist_xyz[1], wrist_xyz[2], 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         dtype=np.float64
     )
 
