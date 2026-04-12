@@ -913,16 +913,22 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             "wrist_targets":  joint_pos_target[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
         }
         _vid_dict = {}
-        for _ck in scene.keys():
-            if "camera" in _ck.lower():
-                try:
-                    _cs = scene[_ck]
-                    if hasattr(_cs, "data") and hasattr(_cs.data, "output"):
-                        _cf = _get_cam_frame(_cs)
-                        if _cf is not None:
-                            _vid_dict[_ck] = _cf
-                except Exception:
-                    pass
+        if recorder.recording:
+            _video_interval = int((1.0 / recorder.video_fps) / sim_dt)
+            _step_count = getattr(run_simulator, "_video_step_count", 0)
+            if _step_count % _video_interval == 0:
+                for _ck in scene.keys():
+                    if "camera" in _ck.lower():
+                        try:
+                            _cs = scene[_ck]
+                            if hasattr(_cs, "data") and hasattr(_cs.data, "output"):
+                                _cf = _get_cam_frame(_cs)
+                                if _cf is not None:
+                                    _vid_dict[_ck] = _cf
+                        except Exception:
+                            pass
+            run_simulator._video_step_count = _step_count + 1
+            
         recorder.add_transition(_obs_dict, _action_dict, _vid_dict)
 
        # --- DOOR PUSH / PULL (PURE SPATIAL) ---
@@ -1120,7 +1126,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
+    sim_cfg = sim_utils.SimulationCfg(dt=0.005, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
     sim.set_camera_view([2.5, 2.5, 2.5], [0.0, 0.0, 0.0])
 
