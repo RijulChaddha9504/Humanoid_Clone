@@ -608,11 +608,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ARM_SHOULDER_AA_GAIN  =  1.8   # Green arrow: sideways (1.5×)
     ARM_ELBOW_FE_GAIN     =  0.7   # Red   arrow: forward via elbow extension
     ARM_POS_CALIB_FRAMES =  30    # Frames to average for the neutral reference
-    ARM_POS_ALPHA        =  0.06  # EMA for active axis: silky smooth motion
-    ARM_RETURN_ALPHA     =  0.06  # EMA for inactive axes: fast snap back to neutral
-    ARM_DEADZONE_XY       =  0.02  # Height/sideways: dead band around screen center
-    ARM_DEADZONE_SIDEWAYS =  0.06  # Sideways-specific: wider (screen-X noisier)
-    ARM_DEADZONE_SCALE    =  0.22  # Forward: ignore depth changes < 8% of neutral scale
+    ARM_POS_ALPHA        =  0.03  # EMA for active axis: siltky smooth motion (was 0.06)
+    ARM_RETURN_ALPHA     =  0.03  # EMA for inactive axes: snap back to neutral
+    ARM_DEADZONE_XY       =  0.05  # Height/sideways: dead band around screen center (was 0.02)
+    ARM_DEADZONE_SIDEWAYS =  0.09  # Sideways-specific: wider (screen-X noisier) (was 0.06)
+    ARM_DEADZONE_SCALE    =  0.28  # Forward: ignore depth changes (was 0.22)
     # Fixed neutral depth reference: wrist→middle-MCP distance when hand is at working distance.
     # Increase if your hand appears SMALL at neutral; decrease if it appears LARGE.
     # Purely absolute — no per-session calibration needed.
