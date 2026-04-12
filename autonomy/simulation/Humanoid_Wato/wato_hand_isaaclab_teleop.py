@@ -104,27 +104,28 @@ def _get_cam_quat(azimuth_deg: float, pitch_deg: float = 25.0):
         return (1.0, 0.0, 0.0, 0.0)
 
 
+# ── Camera names used for IL recording ─────────────────────────────────────
+_IL_CAMERAS = ["camera_back", "camera_diag_left", "camera_diag_right"]
+
+
 class DemonstrationRecorder:
     """
     Records robot hand demonstrations for Imitation Learning.
 
-    HDF5 per-episode schema (demonstrations/robot_demos_N.hdf5)
-    -------------------------------------------------------------
-    episode_N/
-        observations/
-            finger_joint_pos   (T, N_f)   all finger DOF positions
-            finger_joint_vel   (T, N_f)   all finger DOF velocities
-            arm_joint_pos      (T, N_a)   shoulder + elbow positions
-            arm_joint_vel      (T, N_a)   shoulder + elbow velocities
-            wrist_state        (T, 2)     [forearm_rotation, wrist_extension]
-            palm_pose          (T, 7)     palm pos(3) + quat(4) in world frame
-            door_hinge_angle   (T, 1)     door joint angle
-            hand_visible       (T, 1)     MediaPipe tracking quality flag
-        actions/
-            finger_targets     (T, N_f)
-            arm_targets        (T, N_a)
-            wrist_targets      (T, 2)
-        attrs: video_path_<cam> for each saved MP4
+    Saves in robomimic-compatible HDF5 format (one file per episode):
+
+    demonstrations/robot_demos_N.hdf5
+    └── data/
+        └── demo_N/
+            ├── actions            (T, 5+N_f)  [arm(3), wrist(2), finger(N_f)]
+            ├── rewards            (T,)
+            ├── dones              (T,)  last step = 1
+            └── obs/
+                ├── state          (T, 8+2*N_f)
+                ├── ee_poses       (T, 7)
+                └── joint_positions(T, 5+N_f)
+        attrs: env_args JSON, num_samples
+        video_path_<cam> attrs per camera
 
     MP4 videos saved to: recordings/episode_N_<cam>.mp4
     """
@@ -136,7 +137,7 @@ class DemonstrationRecorder:
         self.recordings_dir.mkdir(exist_ok=True, parents=True)
         self.episodes: list = []
         self.recording = False
-        self.video_fps = 10
+        self.video_fps = 20  # 20 Hz — matches GR00T's standard training rate
 
         # Resume episode counter from existing recordings
         self.episode_counter = 0
@@ -157,23 +158,22 @@ class DemonstrationRecorder:
 
         self._current: dict = {}
         print(f"[INFO] DemonstrationRecorder ready  →  {self.save_dir.absolute()}")
+        print(f"[INFO] Recording cameras: {_IL_CAMERAS}")
 
     def _blank_episode(self) -> dict:
         return {
             "episode_num": self.episode_counter,
+            # Raw per-key lists (used to build obs/state, obs/joint_positions)
             "obs": {
                 "finger_joint_pos": [], "finger_joint_vel": [],
                 "arm_joint_pos":    [], "arm_joint_vel":    [],
                 "wrist_state":      [],
-                "palm_pose":        [],
+                "palm_pose":        [],        # → obs/ee_poses
                 "door_hinge_angle": [],
                 "hand_visible":     [],
             },
-            "actions": {
-                "finger_targets": [],
-                "arm_targets":    [],
-                "wrist_targets":  [],
-            },
+            # Flat concatenated action each timestep  [arm(3) | wrist(2) | finger(N_f)]
+            "actions_flat": [],
             "video_frames": {},
         }
 
@@ -186,7 +186,10 @@ class DemonstrationRecorder:
         self._current = self._blank_episode()
         print(f"[RECORDING] ▶  Started episode_{self.episode_counter}")
 
-    def add_transition(self, obs_dict: dict, action_dict: dict, video_frames_dict: dict = None):
+    def add_transition(self,
+                       obs_dict: dict,
+                       action_flat,          # 1D numpy array: [arm|wrist|finger]
+                       video_frames_dict: dict = None):
         """Append one timestep of data."""
         if not self.recording:
             return
@@ -196,18 +199,22 @@ class DemonstrationRecorder:
                 return np.zeros(1)
             if hasattr(t, "cpu"):
                 return t.squeeze(0).cpu().numpy()
-            return np.asarray(t)
+            return np.asarray(t, dtype=np.float32)
 
         for k, v in obs_dict.items():
             if k in self._current["obs"]:
                 self._current["obs"][k].append(_to_np(v))
 
-        for k, v in action_dict.items():
-            if k in self._current["actions"]:
-                self._current["actions"][k].append(_to_np(v))
+        # Store flat action
+        if action_flat is not None:
+            if hasattr(action_flat, "cpu"):
+                action_flat = action_flat.squeeze(0).cpu().numpy()
+            self._current["actions_flat"].append(np.asarray(action_flat, dtype=np.float32))
 
         if video_frames_dict:
             for cam, frame in video_frames_dict.items():
+                if cam not in _IL_CAMERAS:
+                    continue  # only store the 3 chosen cameras
                 if cam not in self._current["video_frames"]:
                     self._current["video_frames"][cam] = []
                 if hasattr(frame, "cpu"):
@@ -248,14 +255,15 @@ class DemonstrationRecorder:
             print("[WARN] Not currently recording")
             return
         self.recording = False
-        n_steps = len(self._current["obs"].get("finger_joint_pos", []))
+        n_steps = len(self._current["actions_flat"])
         if n_steps == 0:
             print("[WARN] Episode ended with no data — discarding")
             return
         ep_num = self._current["episode_num"]
         # Save MP4 per camera
         video_paths = {}
-        for cam, frames in self._current["video_frames"].items():
+        for cam in _IL_CAMERAS:
+            frames = self._current["video_frames"].get(cam, [])
             path = self._save_video(frames, ep_num, cam)
             if path:
                 video_paths[cam] = path
@@ -267,28 +275,73 @@ class DemonstrationRecorder:
         self.save()
 
     def save(self):
-        """Flush all in-memory episodes to individual HDF5 files."""
+        """Flush all in-memory episodes to individual robomimic-format HDF5 files."""
         if not self.episodes:
             return
+        import json as _json
+        env_args = _json.dumps({
+            "env_name": "IsaacLab-WatoHand",
+            "type": 1,
+            "env_kwargs": {},
+        })
         for ep in self.episodes:
             ep_num = ep["episode_num"]
             hdf5_path = self.save_dir / f"robot_demos_{ep_num}.hdf5"
             try:
+                obs = ep["obs"]
+
+                def _stack(key):
+                    lst = obs.get(key, [])
+                    if not lst:
+                        return None
+                    return np.array(lst, dtype=np.float32)
+
+                arm_pos  = _stack("arm_joint_pos")    # (T, 3)
+                arm_vel  = _stack("arm_joint_vel")    # (T, 3)
+                wrist    = _stack("wrist_state")       # (T, 2)
+                f_pos    = _stack("finger_joint_pos") # (T, N_f)
+                f_vel    = _stack("finger_joint_vel") # (T, N_f)
+                palm     = _stack("palm_pose")         # (T, 7)
+
+                # obs/state: [arm_pos | arm_vel | wrist | finger_pos | finger_vel]
+                state_parts = [p for p in [arm_pos, arm_vel, wrist, f_pos, f_vel] if p is not None]
+                state = np.concatenate(state_parts, axis=1) if state_parts else np.zeros((1, 1), dtype=np.float32)
+
+                # obs/joint_positions: [arm_pos | wrist | finger_pos]
+                jp_parts = [p for p in [arm_pos, wrist, f_pos] if p is not None]
+                joint_positions = np.concatenate(jp_parts, axis=1) if jp_parts else np.zeros((1, 1), dtype=np.float32)
+
+                # ee_poses = palm_pose
+                ee_poses = palm if palm is not None else np.zeros((state.shape[0], 7), dtype=np.float32)
+
+                # actions
+                actions = np.array(ep["actions_flat"], dtype=np.float32)  # (T, 5+N_f)
+
+                T = actions.shape[0]
+                rewards = np.zeros(T, dtype=np.float32)
+                dones   = np.zeros(T, dtype=np.float32)
+                dones[-1] = 1.0
+
                 with h5py.File(hdf5_path, "w") as f:
-                    grp = f.create_group(f"episode_{ep_num}")
-                    obs_grp = grp.create_group("observations")
-                    for k, v in ep["obs"].items():
-                        if v:
-                            obs_grp.create_dataset(k, data=np.array(v))
-                    act_grp = grp.create_group("actions")
-                    for k, v in ep["actions"].items():
-                        if v:
-                            act_grp.create_dataset(k, data=np.array(v))
+                    data_grp = f.create_group("data")
+                    data_grp.attrs["env_args"]     = env_args
+                    data_grp.attrs["total"]        = T
+                    demo_grp = data_grp.create_group(f"demo_{ep_num}")
+                    demo_grp.attrs["num_samples"]  = T
+                    demo_grp.create_dataset("actions",  data=actions)
+                    demo_grp.create_dataset("rewards",  data=rewards)
+                    demo_grp.create_dataset("dones",    data=dones)
+                    obs_grp = demo_grp.create_group("obs")
+                    obs_grp.create_dataset("state",           data=state)
+                    obs_grp.create_dataset("ee_poses",        data=ee_poses)
+                    obs_grp.create_dataset("joint_positions", data=joint_positions)
                     for cam, path in ep.get("video_paths", {}).items():
-                        grp.attrs[f"video_path_{cam}"] = path
-                print(f"[SUCCESS] HDF5 → {hdf5_path.absolute()}")
+                        demo_grp.attrs[f"video_path_{cam}"] = path
+
+                print(f"[SUCCESS] HDF5 → {hdf5_path.absolute()}  ({T} steps, action_dim={actions.shape[1]})")
             except Exception as e:
-                print(f"[ERROR] HDF5 save failed: {e}")
+                print(f"[ERROR] HDF5 save failed (episode {ep_num}): {e}")
+                import traceback; traceback.print_exc()
         self.episodes.clear()
 
 
@@ -328,78 +381,40 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     )
     robot = ARM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    door = ArticulationCfg(
-        prim_path="/World/Door",
-        spawn=sim_utils.UrdfFileCfg(
-            asset_path="/workspace/isaaclab/humanoid/autonomy/simulation/Humanoid_Wato/arm_assembly/simple_door.urdf",
-            fix_base=True,
-            scale=(0.3, 0.5, 0.5),
-            joint_drive=sim_utils.UrdfFileCfg.JointDriveCfg(
-                drive_type="force",
-                target_type="position",
-                gains=sim_utils.UrdfFileCfg.JointDriveCfg.PDGainsCfg(
-                    stiffness=100.0,
-                    damping=10.0,
-                ),
-            ),
-        ),
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0, 0.5, -0.25), 
-            rot=(0.707, 0.0, 0.0, 0.707),
-            joint_pos={"door_hinge": 0.0},
-        ),
-        actuators={
-            "hinge": ImplicitActuatorCfg(
-                joint_names_expr=["door_hinge"],
-                effort_limit=50.0, velocity_limit=1.0,
-                stiffness=100.0,
-                damping=10.0,
-            ),
-        },
-    )
+    # ── DOOR TEMPORARILY DISABLED ────────────────────────────────────────────
+    # Uncomment the block below to re-enable the door articulation.
+    # door = ArticulationCfg(
+    #     prim_path="/World/Door",
+    #     spawn=sim_utils.UrdfFileCfg(
+    #         asset_path="/workspace/isaaclab/humanoid/autonomy/simulation/Humanoid_Wato/arm_assembly/simple_door.urdf",
+    #         fix_base=True,
+    #         scale=(0.3, 0.5, 0.5),
+    #         joint_drive=sim_utils.UrdfFileCfg.JointDriveCfg(
+    #             drive_type="force",
+    #             target_type="position",
+    #             gains=sim_utils.UrdfFileCfg.JointDriveCfg.PDGainsCfg(
+    #                 stiffness=100.0,
+    #                 damping=10.0,
+    #             ),
+    #         ),
+    #     ),
+    #     init_state=ArticulationCfg.InitialStateCfg(
+    #         pos=(0, 0.5, -0.25),
+    #         rot=(0.707, 0.0, 0.0, 0.707),
+    #         joint_pos={"door_hinge": 0.0},
+    #     ),
+    #     actuators={
+    #         "hinge": ImplicitActuatorCfg(
+    #             joint_names_expr=["door_hinge"],
+    #             effort_limit=50.0, velocity_limit=1.0,
+    #             stiffness=100.0,
+    #             damping=10.0,
+    #         ),
+    #     },
+    # )
 
-    # ── 9 Cameras for Imitation Learning data collection ────────────────────
-    # Camera 1: Front  (0°, h=0.8m, r=1.2m)
-    camera_front = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera_front",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0,
-            horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(1.2, 0.0, 0.8), rot=_get_cam_quat(0.0, 25.0), convention="world"),
-    )
-    # Camera 2: Front High  (0°, h=1.5m, r=0.8m)
-    camera_front_high = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera_front_high",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0,
-            horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(0.8, 0.0, 1.5), rot=_get_cam_quat(0.0, 55.0), convention="world"),
-    )
-    # Camera 3: Left  (90°, h=0.8m, r=1.2m)
-    camera_left = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera_left",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0,
-            horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(0.0, 1.2, 0.8), rot=_get_cam_quat(90.0, 25.0), convention="world"),
-    )
-    # Camera 4: Right  (270°, h=0.8m, r=1.2m)
-    camera_right = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera_right",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0,
-            horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(0.0, -1.2, 0.8), rot=_get_cam_quat(270.0, 25.0), convention="world"),
-    )
-    # Camera 5: Back  (180°, h=0.8m, r=1.2m)
+    # ── 3 Cameras for Imitation Learning data collection ────────────────────
+    # Camera 1: Back  (180°, h=0.8m, r=1.2m)  — primary back-view camera
     camera_back = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_back",
         update_period=0.1, height=480, width=640, data_types=["rgb"],
@@ -409,17 +424,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
         ),
         offset=CameraCfg.OffsetCfg(pos=(-1.2, 0.0, 0.8), rot=_get_cam_quat(180.0, 25.0), convention="world"),
     )
-    # Camera 6: Front Low  (0°, h=0.3m) — looks slightly upward at fingers
-    camera_front_low = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera_front_low",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0,
-            horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
-        ),
-        offset=CameraCfg.OffsetCfg(pos=(0.8, 0.0, 0.3), rot=_get_cam_quat(0.0, -10.0), convention="world"),
-    )
-    # Camera 7: Diagonal Left  (45°, h=1.0m)
+    # Camera 2: Diagonal Left  (45°, h=1.0m)  — left-side view
     camera_diag_left = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_left",
         update_period=0.1, height=480, width=640, data_types=["rgb"],
@@ -429,7 +434,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
         ),
         offset=CameraCfg.OffsetCfg(pos=(0.85, 0.85, 1.0), rot=_get_cam_quat(45.0, 30.0), convention="world"),
     )
-    # Camera 8: Diagonal Right  (315°, h=1.0m)
+    # Camera 3: Diagonal Right  (315°, h=1.0m)  — right-side view
     camera_diag_right = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_right",
         update_period=0.1, height=480, width=640, data_types=["rgb"],
@@ -439,22 +444,6 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
         ),
         offset=CameraCfg.OffsetCfg(pos=(0.85, -0.85, 1.0), rot=_get_cam_quat(315.0, 30.0), convention="world"),
     )
-    #TEST
-    # Camera 9: Wrist-mounted — attached to palm link, moves with the robot
-    # Positioned above/forward of palm looking down at the fingers
-    '''camera_wrist = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/PALM_GAVIN_1DoF_Hinge_v2_1/wrist_cam",
-        update_period=0.1, height=240, width=320, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=12.0, focus_distance=0.3,
-            horizontal_aperture=20.955, clipping_range=(0.01, 3.0),
-        ),
-        offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.05, 0.1),
-            rot=(0.7071, 0.0, 0.7071, 0.0),
-            convention="ros",
-        ),
-    )'''
 
 
 # ── Main sim loop ─────────────────────────────────────────────────────────────
@@ -483,10 +472,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     _arm_ids    = [name_to_sim_idx[k] for k in _ARM_KW    if k in name_to_sim_idx]
     _wrist_ids  = [name_to_sim_idx[k] for k in _WRIST_KW  if k in name_to_sim_idx]
     _palm_body_idx = robot.data.body_names.index("PALM_GAVIN_1DoF_Hinge_v2_1")
-    # Pre-look up door for recording
-    _door_obj   = scene["door"]
-    _door_jnames = list(_door_obj.data.joint_names)
-    _door_ridx  = _door_jnames.index("door_hinge")
+    # ── DOOR TEMPORARILY DISABLED ────────────────────────────────────────────
+    # _door_obj   = scene["door"]
+    # _door_jnames = list(_door_obj.data.joint_names)
+    # _door_ridx  = _door_jnames.index("door_hinge")
     print(f"[INFO] IL groups — fingers: {len(_finger_ids)} DOF, arm: {len(_arm_ids)} DOF, wrist: {len(_wrist_ids)} DOF")
 
     # ── Demonstration Recorder ─────────────────────────────────────────────────
@@ -873,254 +862,152 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         sim.step()
         scene.update(sim_dt)
 
-        # -- IL DATA COLLECTION (every step; only stores while recorder.recording) --
-        def _get_cam_frame(sensor):
-            try:
-                rgb = sensor.data.output.get("rgb")
-                if rgb is None:
+        # -- IL DATA COLLECTION ──────────────────────────────────────────────────
+        # Both HDF5 state/action AND video are sub-sampled at the SAME unified
+        # rate (recorder.video_fps = 20 Hz) so that data and frames are always
+        # in 1-to-1 correspondence. The physics sim still runs at 200 Hz (dt=0.005)
+        # for stability; we just only *record* every Nth step.
+        _record_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
+        # _record_interval = 10 at 200Hz physics → 20Hz recording
+
+        _step_count = getattr(run_simulator, "_record_step_count", 0)
+        run_simulator._record_step_count = _step_count + 1
+
+        if recorder.recording and (_step_count % _record_interval == 0):
+            # ── helper: grab one RGB frame from a camera sensor ──────────────
+            def _get_cam_frame(sensor):
+                try:
+                    rgb = sensor.data.output.get("rgb")
+                    if rgb is None:
+                        return None
+                    frame = rgb[0] if rgb.ndim == 4 else rgb
+                    if hasattr(frame, "cpu"):
+                        frame = frame.cpu().numpy()
+                    else:
+                        frame = np.asarray(frame)
+                    if frame.dtype != np.uint8:
+                        fmax = frame.max()
+                        frame = (np.clip(frame * 255, 0, 255).astype(np.uint8)
+                                 if fmax <= 1.0 else
+                                 np.clip(frame, 0, 255).astype(np.uint8))
+                    return frame
+                except Exception as _e:
+                    if not hasattr(sensor, "_frame_err"):
+                        print(f"[WARN] Frame capture: {_e}")
+                        sensor._frame_err = True
                     return None
-                frame = rgb[0] if rgb.ndim == 4 else rgb
-                if hasattr(frame, "cpu"):
-                    frame = frame.cpu().numpy()
-                else:
-                    frame = np.asarray(frame)
-                if frame.dtype != np.uint8:
-                    fmax = frame.max()
-                    frame = np.clip(frame * 255, 0, 255).astype(np.uint8) if fmax <= 1.0 else np.clip(frame, 0, 255).astype(np.uint8)
-                return frame
-            except Exception as _e:
-                if not hasattr(sensor, "_frame_err"):
-                    print(f"[WARN] Frame capture: {_e}")
-                    sensor._frame_err = True
-                return None
-        _palm_pos_il  = robot.data.body_pos_w[:, _palm_body_idx, :]
-        _palm_quat_il = robot.data.body_quat_w[:, _palm_body_idx, :]
-        _palm_pose_il = torch.cat([_palm_pos_il, _palm_quat_il], dim=-1)
-        _door_angle_il = _door_obj.data.joint_pos[:, _door_ridx:_door_ridx + 1]
-        _obs_dict = {
-            "finger_joint_pos": robot.data.joint_pos[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
-            "finger_joint_vel": robot.data.joint_vel[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
-            "arm_joint_pos":    robot.data.joint_pos[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
-            "arm_joint_vel":    robot.data.joint_vel[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
-            "wrist_state":      robot.data.joint_pos[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
-            "palm_pose":        _palm_pose_il,
-            "door_hinge_angle": _door_angle_il,
-            "hand_visible":     torch.tensor([[1.0 if hand_visible else 0.0]], device=sim.device),
-        }
-        _action_dict = {
-            "finger_targets": joint_pos_target[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
-            "arm_targets":    joint_pos_target[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
-            "wrist_targets":  joint_pos_target[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
-        }
-        _vid_dict = {}
-        if recorder.recording:
-            _video_interval = int((1.0 / recorder.video_fps) / sim_dt)
-            _step_count = getattr(run_simulator, "_video_step_count", 0)
-            if _step_count % _video_interval == 0:
-                for _ck in scene.keys():
-                    if "camera" in _ck.lower():
-                        try:
-                            _cs = scene[_ck]
-                            if hasattr(_cs, "data") and hasattr(_cs.data, "output"):
-                                _cf = _get_cam_frame(_cs)
-                                if _cf is not None:
-                                    _vid_dict[_ck] = _cf
-                        except Exception:
-                            pass
-            run_simulator._video_step_count = _step_count + 1
-            
-        recorder.add_transition(_obs_dict, _action_dict, _vid_dict)
 
-       # --- DOOR PUSH / PULL (PURE SPATIAL) ---
+            # ── obs ──────────────────────────────────────────────────────────
+            _palm_pos_il  = robot.data.body_pos_w[:, _palm_body_idx, :]
+            _palm_quat_il = robot.data.body_quat_w[:, _palm_body_idx, :]
+            _palm_pose_il = torch.cat([_palm_pos_il, _palm_quat_il], dim=-1)
+            # door_hinge_angle omitted while door is disabled — stored as zero
+            _door_angle_il = torch.zeros(1, 1, device=sim.device)
+            _obs_dict = {
+                "finger_joint_pos": robot.data.joint_pos[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
+                "finger_joint_vel": robot.data.joint_vel[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
+                "arm_joint_pos":    robot.data.joint_pos[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
+                "arm_joint_vel":    robot.data.joint_vel[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
+                "wrist_state":      robot.data.joint_pos[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
+                "palm_pose":        _palm_pose_il,
+                "door_hinge_angle": _door_angle_il,  # placeholder while door disabled
+                "hand_visible":     torch.tensor([[1.0 if hand_visible else 0.0]], device=sim.device),
+            }
 
-        door_obj = scene["door"]
-        door_joint_names = list(door_obj.data.joint_names)
-        door_idx = door_joint_names.index("door_hinge")
+            # ── flat action: [arm(3) | wrist(2) | finger(N_f)] ───────────────
+            _arm_t   = joint_pos_target[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device)
+            _wrist_t = joint_pos_target[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device)
+            _fing_t  = joint_pos_target[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device)
+            _action_flat = torch.cat([_arm_t, _wrist_t, _fing_t], dim=-1).squeeze(0).cpu().numpy().astype(np.float32)
 
-        palm_body_idx = robot.data.body_names.index("PALM_GAVIN_1DoF_Hinge_v2_1")
-        palm_pos = robot.data.body_pos_w[0, palm_body_idx]
+            # ── video frames ──────────────────────────────────────────────────
+            _vid_dict = {}
+            for _ck in _IL_CAMERAS:
+                if _ck in scene.keys():
+                    try:
+                        _cs = scene[_ck]
+                        if hasattr(_cs, "data") and hasattr(_cs.data, "output"):
+                            _cf = _get_cam_frame(_cs)
+                            if _cf is not None:
+                                _vid_dict[_ck] = _cf
+                    except Exception:
+                        pass
 
-        panel_idx = door_obj.data.body_names.index("door_panel")
-        panel_pos = door_obj.data.body_pos_w[0, panel_idx]
+            recorder.add_transition(_obs_dict, _action_flat, _vid_dict)
 
-        # Get door orientation
-        panel_quat = door_obj.data.body_quat_w[0, panel_idx]
-        print("quat:", panel_quat)
-        R = quat_to_matrix(panel_quat)
-
-        # Door normal (TRY AXIS if needed)
-        door_normal = R[:, 0]  # try 1 or 2 if wrong
-
-        # Perpendicular distance to door surface
-        vec = palm_pos - panel_pos
-        dist_to_plane = float(torch.dot(vec, door_normal))
-        surface_dist = abs(dist_to_plane)
-
-        print(f"[SURFACE] dist={surface_dist:.3f}")
-        SURFACE_THRESH = 0.14  # 14 cm
-        is_touching_surface = surface_dist < SURFACE_THRESH
-        is_in_front = dist_to_plane > 0
-
-        hinge_pos = door_obj.data.body_pos_w[0, 0]  # hinge body
-
-        # Distances
-        dist_to_panel = float(torch.norm(palm_pos[:2] - panel_pos[:2]))
-        dist_to_hinge = float(torch.norm(palm_pos[:2] - hinge_pos[:2]))
-
-        # Motion (velocity)
-        prev_palm_x = getattr(run_simulator, '_prev_palm_x', float(palm_pos[0]))
-        palm_dx = float(palm_pos[0]) - prev_palm_x
-        run_simulator._prev_palm_x = float(palm_pos[0])
-
-        # Door state
-        current_door = float(door_obj.data.joint_pos[0, door_idx])
-
-        # Moment arm (avoid divide-by-zero)
-        hinge_to_palm = max(float(torch.norm(palm_pos[:2] - hinge_pos[:2])), 0.05)
-
-        # Thresholds
-        PANEL_THRESH = 0.25
-        HINGE_THRESH = 0.15
-
-        target = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
-
-        # -------------------------------
-        # PUSH: near panel → push forward
-        # -------------------------------
-        print(f"[PUSH] dist_panel={dist_to_panel:.3f} | dx={palm_dx:.4f}")
-        print(f"[PULL] dist_hinge={dist_to_hinge:.3f} | dx={palm_dx:.4f}")
-
-        PROXIMITY_THRESHOLD = 0.3  # must be within 30cm of the panel to interact
-        if not (is_touching_surface):
-            print(f"[DEBUG] Not touching door surface ({surface_dist:.3f}m), dist_to_panel={dist_to_panel:.3f}, dist_to_hinge={dist_to_hinge:.3f}")
-            # --- HARD STOP: no interaction ---
-            effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
-            door_obj.set_joint_effort_target(effort)
-
-            # Also remove any external forces on the hand
-            num_bodies = robot.data.body_pos_w.shape[1]
-            forces = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-            torques = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-
-            robot.set_external_force_and_torque(forces=forces, torques=torques)
-
-            continue  # skip rest of logic
-        else:
-            print(f"[DEBUG] Touching door surface ({surface_dist:.3f}m), dist_to_panel={dist_to_panel:.3f}, dist_to_hinge={dist_to_hinge:.3f}")
-            if dist_to_panel > PANEL_THRESH:
-                print("PUSHING MOTION")
-
-                # --- TARGET: fully open (same limit you used) ---
-                OPEN_TARGET = -0.524
-                error = OPEN_TARGET - current_door
-
-                # ---------------------------
-                # 1) STRONG DOOR TORQUE (PUSH)
-                # ---------------------------
-                TORQUE_GAIN = 300.0
-                DAMPING = 20.0
-
-                # Door velocity (reuse same tracker as pull)
-                prev_door = getattr(run_simulator, "_prev_door_angle", current_door)
-                door_vel = current_door - prev_door
-                run_simulator._prev_door_angle = current_door
-
-                # PD torque toward OPEN
-                torque = TORQUE_GAIN * error - DAMPING * door_vel
-                torque = float(max(min(torque, 300.0), -300.0))
-
-                effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
-                effort[0, door_idx] = torque
-
-                door_obj.set_joint_effort_target(effort)
-
-                # ---------------------------
-                # 2) REACTION FORCE ON HAND (PUSH BACK)
-                # ---------------------------
-                PALM_FORCE_GAIN = 100.0
-
-                # Opposite of pull → push AWAY from hinge
-                dir_vec = palm_pos - hinge_pos
-                dir_vec = dir_vec / (torch.norm(dir_vec) + 1e-6)
-
-                force = PALM_FORCE_GAIN * abs(error) * dir_vec
-
-                # Apply to articulation (Isaac Lab format)
-                num_bodies = robot.data.body_pos_w.shape[1]
-
-                forces = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-                torques = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-
-                forces[0, palm_body_idx] = force
-
-                robot.set_external_force_and_torque(
-                    forces=forces,
-                    torques=torques,
-                )
-
-                print(f"[PUSH FORCE] error={error:.3f} | torque={torque:.2f}")
-            # -------------------------------
-            # PULL: near hinge → pull back
-            # -------------------------------
-
-
-            else:
-                print("PULLING MOTION")
-
-                # --- TARGET: fully closed ---
-                CLOSE_TARGET = 0.0
-                error = CLOSE_TARGET - current_door
-
-                # ---------------------------
-                # 1) STRONG DOOR TORQUE
-                # ---------------------------
-                TORQUE_GAIN = 300.0   # crank this if needed
-                DAMPING = 20.0        # stabilizes oscillation
-
-                # Estimate door velocity (finite difference)
-                prev_door = getattr(run_simulator, "_prev_door_angle", current_door)
-                door_vel = current_door - prev_door
-                run_simulator._prev_door_angle = current_door
-
-                # PD controller → torque
-                torque = TORQUE_GAIN * error - DAMPING * door_vel
-
-                # Clamp torque
-                torque = float(max(min(torque, 300.0), -300.0))
-
-                effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
-                effort[0, door_idx] = torque
-
-                # Apply REAL torque (not position target)
-                door_obj.set_joint_effort_target(effort)
-
-                # ---------------------------
-                # 2) REACTION FORCE ON HAND
-                # ---------------------------
-                PALM_FORCE_GAIN = 250.0
-
-                # Direction: hinge ← palm
-                dir_vec = hinge_pos - palm_pos
-                dir_vec = dir_vec / (torch.norm(dir_vec) + 1e-6)
-
-                # Scale with how "hard" we're closing
-                force = PALM_FORCE_GAIN * abs(error) * dir_vec
-
-                # Build force tensor for ALL bodies (required API format)
-                num_bodies = robot.data.body_pos_w.shape[1]
-
-                forces = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-                torques = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
-
-                # Apply ONLY to palm
-                forces[0, palm_body_idx] = force
-
-                # Apply to articulation
-                robot.set_external_force_and_torque(
-                    forces=forces,
-                    torques=torques,
-                )
-                print(f"[PULL FORCE] error={error:.3f} | torque={torque:.2f}")
+        # ── DOOR PUSH / PULL — TEMPORARILY DISABLED ───────────────────────────
+        # Uncomment this entire block to re-enable door interaction.
+        #
+        # door_obj = scene["door"]
+        # door_joint_names = list(door_obj.data.joint_names)
+        # door_idx = door_joint_names.index("door_hinge")
+        # palm_body_idx = robot.data.body_names.index("PALM_GAVIN_1DoF_Hinge_v2_1")
+        # palm_pos = robot.data.body_pos_w[0, palm_body_idx]
+        # panel_idx = door_obj.data.body_names.index("door_panel")
+        # panel_pos = door_obj.data.body_pos_w[0, panel_idx]
+        # panel_quat = door_obj.data.body_quat_w[0, panel_idx]
+        # R = quat_to_matrix(panel_quat)
+        # door_normal = R[:, 0]
+        # vec = palm_pos - panel_pos
+        # dist_to_plane = float(torch.dot(vec, door_normal))
+        # surface_dist = abs(dist_to_plane)
+        # SURFACE_THRESH = 0.14
+        # is_touching_surface = surface_dist < SURFACE_THRESH
+        # is_in_front = dist_to_plane > 0
+        # hinge_pos = door_obj.data.body_pos_w[0, 0]
+        # dist_to_panel = float(torch.norm(palm_pos[:2] - panel_pos[:2]))
+        # dist_to_hinge = float(torch.norm(palm_pos[:2] - hinge_pos[:2]))
+        # prev_palm_x = getattr(run_simulator, '_prev_palm_x', float(palm_pos[0]))
+        # palm_dx = float(palm_pos[0]) - prev_palm_x
+        # run_simulator._prev_palm_x = float(palm_pos[0])
+        # current_door = float(door_obj.data.joint_pos[0, door_idx])
+        # hinge_to_palm = max(float(torch.norm(palm_pos[:2] - hinge_pos[:2])), 0.05)
+        # PANEL_THRESH = 0.25
+        # HINGE_THRESH = 0.15
+        # target = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
+        # if not is_touching_surface:
+        #     effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
+        #     door_obj.set_joint_effort_target(effort)
+        #     num_bodies = robot.data.body_pos_w.shape[1]
+        #     forces  = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
+        #     torques = torch.zeros((1, num_bodies, 3), device=palm_pos.device)
+        #     robot.set_external_force_and_torque(forces=forces, torques=torques)
+        # else:
+        #     if dist_to_panel > PANEL_THRESH:  # PUSH
+        #         OPEN_TARGET = -0.524
+        #         error = OPEN_TARGET - current_door
+        #         TORQUE_GAIN = 300.0; DAMPING = 20.0
+        #         prev_door = getattr(run_simulator, "_prev_door_angle", current_door)
+        #         door_vel  = current_door - prev_door
+        #         run_simulator._prev_door_angle = current_door
+        #         torque = float(max(min(TORQUE_GAIN * error - DAMPING * door_vel, 300.0), -300.0))
+        #         effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
+        #         effort[0, door_idx] = torque
+        #         door_obj.set_joint_effort_target(effort)
+        #         dir_vec = (palm_pos - hinge_pos) / (torch.norm(palm_pos - hinge_pos) + 1e-6)
+        #         force   = 100.0 * abs(error) * dir_vec
+        #         forces  = torch.zeros((1, robot.data.body_pos_w.shape[1], 3), device=palm_pos.device)
+        #         torques = torch.zeros_like(forces)
+        #         forces[0, palm_body_idx] = force
+        #         robot.set_external_force_and_torque(forces=forces, torques=torques)
+        #     else:  # PULL
+        #         CLOSE_TARGET = 0.0
+        #         error = CLOSE_TARGET - current_door
+        #         TORQUE_GAIN = 300.0; DAMPING = 20.0
+        #         prev_door = getattr(run_simulator, "_prev_door_angle", current_door)
+        #         door_vel  = current_door - prev_door
+        #         run_simulator._prev_door_angle = current_door
+        #         torque = float(max(min(TORQUE_GAIN * error - DAMPING * door_vel, 300.0), -300.0))
+        #         effort = torch.zeros(1, len(door_joint_names), device=palm_pos.device)
+        #         effort[0, door_idx] = torque
+        #         door_obj.set_joint_effort_target(effort)
+        #         dir_vec = (hinge_pos - palm_pos) / (torch.norm(hinge_pos - palm_pos) + 1e-6)
+        #         force   = 250.0 * abs(error) * dir_vec
+        #         forces  = torch.zeros((1, robot.data.body_pos_w.shape[1], 3), device=palm_pos.device)
+        #         torques = torch.zeros_like(forces)
+        #         forces[0, palm_body_idx] = force
+        #         robot.set_external_force_and_torque(forces=forces, torques=torques)
+        # ── end door block ────────────────────────────────────────────────────
 
 
 
