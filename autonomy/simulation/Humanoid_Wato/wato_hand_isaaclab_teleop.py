@@ -184,6 +184,7 @@ class DemonstrationRecorder:
             return
         self.recording = True
         self._current = self._blank_episode()
+        self._episode_start_t = time.time()   # wall-clock start for real FPS
         print(f"[RECORDING] ▶  Started episode_{self.episode_counter}")
 
     def add_transition(self,
@@ -225,25 +226,33 @@ class DemonstrationRecorder:
                              else np.clip(frame, 0, 255)).astype(np.uint8)
                 self._current["video_frames"][cam].append(frame)
 
-    def _save_video(self, frames: list, episode_num: int, cam_name: str):
+    def _save_video(self, frames: list, episode_num: int, cam_name: str,
+                    real_fps: float = None):
+        """Save frames as MP4.
+
+        Args:
+            real_fps: actual wall-clock capture rate (frames/second).
+                      Falls back to self.video_fps when unavailable.
+        """
         if not frames:
             return None
+        fps_to_use = real_fps if real_fps and real_fps > 0 else self.video_fps
         video_path = self.recordings_dir / f"episode_{episode_num}_{cam_name}.mp4"
         try:
             if CV2_AVAILABLE:
                 h, w = frames[0].shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                out = cv2.VideoWriter(str(video_path), fourcc, self.video_fps, (w, h))
+                out = cv2.VideoWriter(str(video_path), fourcc, fps_to_use, (w, h))
                 for f in frames:
                     bgr = cv2.cvtColor(f.astype(np.uint8), cv2.COLOR_RGB2BGR) if f.ndim == 3 and f.shape[2] == 3 else f.astype(np.uint8)
                     out.write(bgr)
                 out.release()
             elif IMAGEIO_AVAILABLE:
-                imageio.mimwrite(str(video_path), [f.astype(np.uint8) for f in frames], fps=self.video_fps)
+                imageio.mimwrite(str(video_path), [f.astype(np.uint8) for f in frames], fps=fps_to_use)
             else:
                 print("[WARN] No video library (cv2/imageio). Video not saved.")
                 return None
-            print(f"[VIDEO] {len(frames)} frames → {video_path}")
+            print(f"[VIDEO] {len(frames)} frames @ {fps_to_use:.1f} fps → {video_path}")
             return str(video_path)
         except Exception as e:
             print(f"[ERROR] Video save failed ({cam_name}): {e}")
@@ -255,16 +264,34 @@ class DemonstrationRecorder:
             print("[WARN] Not currently recording")
             return
         self.recording = False
+        elapsed = time.time() - getattr(self, "_episode_start_t", time.time())
         n_steps = len(self._current["actions_flat"])
         if n_steps == 0:
             print("[WARN] Episode ended with no data — discarding")
             return
         ep_num = self._current["episode_num"]
-        # Save MP4 per camera
+
+        # Compute true wall-clock FPS from the first camera that has frames.
+        # Clamp to [1, 60] to guard against timers that weren't set or edge cases.
+        first_cam_frames = 0
+        for cam in _IL_CAMERAS:
+            fc = len(self._current["video_frames"].get(cam, []))
+            if fc > 0:
+                first_cam_frames = fc
+                break
+        if first_cam_frames > 1 and elapsed > 0.5:
+            true_fps = first_cam_frames / elapsed
+            true_fps = float(max(1.0, min(60.0, true_fps)))
+        else:
+            true_fps = float(self.video_fps)   # fallback
+        print(f"[RECORDING] Wall-clock elapsed: {elapsed:.1f}s  |  "
+              f"{first_cam_frames} frames  |  true fps ≈ {true_fps:.1f}")
+
+        # Save MP4 per camera using the measured real fps
         video_paths = {}
         for cam in _IL_CAMERAS:
             frames = self._current["video_frames"].get(cam, [])
-            path = self._save_video(frames, ep_num, cam)
+            path = self._save_video(frames, ep_num, cam, real_fps=true_fps)
             if path:
                 video_paths[cam] = path
         self._current["video_paths"] = video_paths
@@ -417,7 +444,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 1: Back  (180°, h=0.8m, r=1.2m)  — primary back-view camera
     camera_back = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_back",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
+        update_period=0.05, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
@@ -427,7 +454,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 2: Diagonal Left  (45°, h=1.0m)  — left-side view
     camera_diag_left = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_left",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
+        update_period=0.05, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
@@ -437,7 +464,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 3: Diagonal Right  (315°, h=1.0m)  — right-side view
     camera_diag_right = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_right",
-        update_period=0.1, height=480, width=640, data_types=["rgb"],
+        update_period=0.05, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
