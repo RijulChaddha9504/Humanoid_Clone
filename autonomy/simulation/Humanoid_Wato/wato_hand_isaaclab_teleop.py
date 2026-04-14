@@ -920,13 +920,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 return None
 
         if recorder.recording:
+            # Increment ONCE
             _step_count = getattr(run_simulator, "_record_step_count", 0)
             run_simulator._record_step_count = _step_count + 1
 
             _cam_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
+            _record_interval = _cam_interval  # keep consistent
 
+            # VIDEO
             if _step_count % _cam_interval == 0:
-            # VIDEO: every step, deduplicated by fast byte-hash
                 for _ck in _IL_CAMERAS:
                     if _ck not in scene.keys():
                         continue
@@ -937,20 +939,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                         _cf = _get_cam_frame(_cs)
                         if _cf is None:
                             continue
-                        _fhash = hash(_cf.tobytes()[:4096])
 
-                        setattr(run_simulator, f"_prev_hash_{_ck}", _fhash)
                         if _ck not in recorder._current["video_frames"]:
                             recorder._current["video_frames"][_ck] = []
                         recorder._current["video_frames"][_ck].append(_cf)
                     except Exception:
                         pass
 
-            # HDF5: sub-sampled at recorder.video_fps sim-Hz
-            _record_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
-            _step_count = getattr(run_simulator, "_record_step_count", 0)
-            run_simulator._record_step_count = _step_count + 1
-
+            # HDF5 (CRITICAL)
             if _step_count % _record_interval == 0:
                 _palm_pos_il  = robot.data.body_pos_w[:, _palm_body_idx, :]
                 _palm_quat_il = robot.data.body_quat_w[:, _palm_body_idx, :]
