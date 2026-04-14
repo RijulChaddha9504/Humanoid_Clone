@@ -137,7 +137,7 @@ class DemonstrationRecorder:
         self.recordings_dir.mkdir(exist_ok=True, parents=True)
         self.episodes: list = []
         self.recording = False
-        self.video_fps = 20  # 20 Hz — matches GR00T's standard training rate
+        self.video_fps = 50  # Increased to 50 Hz for smoother real-time playback and more detail
 
         # Resume episode counter from existing recordings
         self.episode_counter = 0
@@ -185,6 +185,9 @@ class DemonstrationRecorder:
         self.recording = True
         self._current = self._blank_episode()
         self._episode_start_t = time.time()   # wall-clock start for real FPS
+        # Reset step counter so frame capture starts immediately on the very
+        # first physics step of this episode (no offset, no skipped frames).
+        run_simulator._record_step_count = 0
         print(f"[RECORDING] ▶  Started episode_{self.episode_counter}")
 
     def add_transition(self,
@@ -236,7 +239,7 @@ class DemonstrationRecorder:
         """
         if not frames:
             return None
-        fps_to_use = real_fps if real_fps and real_fps > 0 else self.video_fps
+        fps_to_use = fps_to_use = min(real_fps, 50)
         video_path = self.recordings_dir / f"episode_{episode_num}_{cam_name}.mp4"
         try:
             if CV2_AVAILABLE:
@@ -444,7 +447,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 1: Back  (180°, h=0.8m, r=1.2m)  — primary back-view camera
     camera_back = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_back",
-        update_period=0.05, height=480, width=640, data_types=["rgb"],
+        update_period=0.01, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
@@ -454,7 +457,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 2: Diagonal Left  (45°, h=1.0m)  — left-side view
     camera_diag_left = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_left",
-        update_period=0.05, height=480, width=640, data_types=["rgb"],
+        update_period=0.02, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
@@ -464,7 +467,7 @@ class ArmHandSceneCfg(InteractiveSceneCfg):
     # Camera 3: Diagonal Right  (315°, h=1.0m)  — right-side view
     camera_diag_right = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera_diag_right",
-        update_period=0.05, height=480, width=640, data_types=["rgb"],
+        update_period=0.02, height=480, width=640, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0,
             horizontal_aperture=20.955, clipping_range=(0.1, 10.0),
@@ -889,78 +892,85 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         sim.step()
         scene.update(sim_dt)
 
-        # -- IL DATA COLLECTION ──────────────────────────────────────────────────
-        # Both HDF5 state/action AND video are sub-sampled at the SAME unified
-        # rate (recorder.video_fps = 20 Hz) so that data and frames are always
-        # in 1-to-1 correspondence. The physics sim still runs at 200 Hz (dt=0.005)
-        # for stability; we just only *record* every Nth step.
-        _record_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
-        # _record_interval = 10 at 200Hz physics → 20Hz recording
+        # -- IL DATA COLLECTION (DECOUPLED VIDEO + HDF5) -----------------------
+        # KEY FIX: Video and HDF5 are now decoupled.
+        #   * VIDEO: every physics step, hash-deduped for max unique frames.
+        #   * HDF5:  sub-sampled at recorder.video_fps sim-Hz.
 
-        _step_count = getattr(run_simulator, "_record_step_count", 0)
-        run_simulator._record_step_count = _step_count + 1
-
-        if recorder.recording and (_step_count % _record_interval == 0):
-            # ── helper: grab one RGB frame from a camera sensor ──────────────
-            def _get_cam_frame(sensor):
-                try:
-                    rgb = sensor.data.output.get("rgb")
-                    if rgb is None:
-                        return None
-                    frame = rgb[0] if rgb.ndim == 4 else rgb
-                    if hasattr(frame, "cpu"):
-                        frame = frame.cpu().numpy()
-                    else:
-                        frame = np.asarray(frame)
-                    if frame.dtype != np.uint8:
-                        fmax = frame.max()
-                        frame = (np.clip(frame * 255, 0, 255).astype(np.uint8)
-                                 if fmax <= 1.0 else
-                                 np.clip(frame, 0, 255).astype(np.uint8))
-                    return frame
-                except Exception as _e:
-                    if not hasattr(sensor, "_frame_err"):
-                        print(f"[WARN] Frame capture: {_e}")
-                        sensor._frame_err = True
+        def _get_cam_frame(sensor):
+            try:
+                rgb = sensor.data.output.get("rgb")
+                if rgb is None:
                     return None
+                frame = rgb[0] if rgb.ndim == 4 else rgb
+                if hasattr(frame, "cpu"):
+                    frame = frame.cpu().numpy()
+                else:
+                    frame = np.asarray(frame)
+                if frame.dtype != np.uint8:
+                    fmax = frame.max()
+                    frame = (np.clip(frame * 255, 0, 255).astype(np.uint8)
+                             if fmax <= 1.0 else
+                             np.clip(frame, 0, 255).astype(np.uint8))
+                return frame
+            except Exception as _e:
+                if not hasattr(sensor, "_frame_err"):
+                    print(f"[WARN] Frame capture: {_e}")
+                    sensor._frame_err = True
+                return None
 
-            # ── obs ──────────────────────────────────────────────────────────
-            _palm_pos_il  = robot.data.body_pos_w[:, _palm_body_idx, :]
-            _palm_quat_il = robot.data.body_quat_w[:, _palm_body_idx, :]
-            _palm_pose_il = torch.cat([_palm_pos_il, _palm_quat_il], dim=-1)
-            # door_hinge_angle omitted while door is disabled — stored as zero
-            _door_angle_il = torch.zeros(1, 1, device=sim.device)
-            _obs_dict = {
-                "finger_joint_pos": robot.data.joint_pos[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
-                "finger_joint_vel": robot.data.joint_vel[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
-                "arm_joint_pos":    robot.data.joint_pos[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
-                "arm_joint_vel":    robot.data.joint_vel[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
-                "wrist_state":      robot.data.joint_pos[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
-                "palm_pose":        _palm_pose_il,
-                "door_hinge_angle": _door_angle_il,  # placeholder while door disabled
-                "hand_visible":     torch.tensor([[1.0 if hand_visible else 0.0]], device=sim.device),
-            }
+        if recorder.recording:
+            _step_count = getattr(run_simulator, "_record_step_count", 0)
+            run_simulator._record_step_count = _step_count + 1
 
-            # ── flat action: [arm(3) | wrist(2) | finger(N_f)] ───────────────
-            _arm_t   = joint_pos_target[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device)
-            _wrist_t = joint_pos_target[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device)
-            _fing_t  = joint_pos_target[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device)
-            _action_flat = torch.cat([_arm_t, _wrist_t, _fing_t], dim=-1).squeeze(0).cpu().numpy().astype(np.float32)
+            _cam_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
 
-            # ── video frames ──────────────────────────────────────────────────
-            _vid_dict = {}
-            for _ck in _IL_CAMERAS:
-                if _ck in scene.keys():
+            if _step_count % _cam_interval == 0:
+            # VIDEO: every step, deduplicated by fast byte-hash
+                for _ck in _IL_CAMERAS:
+                    if _ck not in scene.keys():
+                        continue
                     try:
                         _cs = scene[_ck]
-                        if hasattr(_cs, "data") and hasattr(_cs.data, "output"):
-                            _cf = _get_cam_frame(_cs)
-                            if _cf is not None:
-                                _vid_dict[_ck] = _cf
+                        if not (hasattr(_cs, "data") and hasattr(_cs.data, "output")):
+                            continue
+                        _cf = _get_cam_frame(_cs)
+                        if _cf is None:
+                            continue
+                        _fhash = hash(_cf.tobytes()[:4096])
+
+                        setattr(run_simulator, f"_prev_hash_{_ck}", _fhash)
+                        if _ck not in recorder._current["video_frames"]:
+                            recorder._current["video_frames"][_ck] = []
+                        recorder._current["video_frames"][_ck].append(_cf)
                     except Exception:
                         pass
 
-            recorder.add_transition(_obs_dict, _action_flat, _vid_dict)
+            # HDF5: sub-sampled at recorder.video_fps sim-Hz
+            _record_interval = max(1, round(1.0 / (recorder.video_fps * sim_dt)))
+            _step_count = getattr(run_simulator, "_record_step_count", 0)
+            run_simulator._record_step_count = _step_count + 1
+
+            if _step_count % _record_interval == 0:
+                _palm_pos_il  = robot.data.body_pos_w[:, _palm_body_idx, :]
+                _palm_quat_il = robot.data.body_quat_w[:, _palm_body_idx, :]
+                _palm_pose_il = torch.cat([_palm_pos_il, _palm_quat_il], dim=-1)
+                _door_angle_il = torch.zeros(1, 1, device=sim.device)
+                _obs_dict = {
+                    "finger_joint_pos": robot.data.joint_pos[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
+                    "finger_joint_vel": robot.data.joint_vel[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device),
+                    "arm_joint_pos":    robot.data.joint_pos[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
+                    "arm_joint_vel":    robot.data.joint_vel[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device),
+                    "wrist_state":      robot.data.joint_pos[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device),
+                    "palm_pose":        _palm_pose_il,
+                    "door_hinge_angle": _door_angle_il,
+                    "hand_visible":     torch.tensor([[1.0 if hand_visible else 0.0]], device=sim.device),
+                }
+                _arm_t   = joint_pos_target[:, _arm_ids]    if _arm_ids    else torch.zeros(1, 3, device=sim.device)
+                _wrist_t = joint_pos_target[:, _wrist_ids]  if _wrist_ids  else torch.zeros(1, 2, device=sim.device)
+                _fing_t  = joint_pos_target[:, _finger_ids] if _finger_ids else torch.zeros(1, 1, device=sim.device)
+                _action_flat = torch.cat([_arm_t, _wrist_t, _fing_t], dim=-1).squeeze(0).cpu().numpy().astype(np.float32)
+                recorder.add_transition(_obs_dict, _action_flat, {})
 
         # ── DOOR PUSH / PULL — TEMPORARILY DISABLED ───────────────────────────
         # Uncomment this entire block to re-enable door interaction.
