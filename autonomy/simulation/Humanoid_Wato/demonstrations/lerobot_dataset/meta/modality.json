@@ -1,0 +1,37 @@
+{
+  "video": {
+    "camera_back": {
+      "original_key": "observation.images.camera_back"
+    },
+    "camera_diag_left": {
+      "original_key": "observation.images.camera_diag_left"
+    },
+    "camera_diag_right": {
+      "original_key": "observation.images.camera_diag_right"
+    }
+  },
+  "state": {
+    "joint_positions": {
+      "start": 0,
+      "end": 20,
+      "original_key": "observation.joint_positions"
+    },
+    "ee_poses": {
+      "start": 0,
+      "end": 7,
+      "original_key": "observation.ee_pose"
+    }
+  },
+  "action": {
+    "arm_wrist_finger": {
+      "start": 0,
+      "end": 20,
+      "original_key": "action"
+    }
+  },
+  "annotation": {
+    "human.task_description": {
+      "original_key": "annotation.human.task_description"
+    }
+  }
+}
