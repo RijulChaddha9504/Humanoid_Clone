@@ -11,6 +11,9 @@
 #SBATCH --job-name=groot_hand_training
 #SBATCH --output=/home/rijul_chaddha/groot_hand_training_%j.log
 
+# Your HuggingFace token — set this before submitting:
+# export HF_TOKEN="hf_XXXX"   ← run this in your shell before sbatch
+
 # ── 1. Start Docker daemon ────────────────────────────────────────────────────
 slurm-start-dockerd.sh
 export DOCKER_HOST=unix:///tmp/run/docker.sock
@@ -139,13 +142,14 @@ TRANSFORMERS_ATTN_IMPLEMENTATION=eager \
 echo "Training complete! Uploading to HuggingFace..."
 /isaac-sim/kit/python/bin/python3 -c "
 from huggingface_hub import HfApi
-api = HfApi(token='hf_YOUR_TOKEN_HERE')  # <-- replace with your token
+import os
+api = HfApi(token=os.environ['HF_TOKEN'])
 api.upload_folder(
     folder_path='$CHECKPOINT_DIR',
-    repo_id='Ultrox9504/wato-hand-model-weights',   # <-- update repo name if needed
+    repo_id='Ultrox9504/wato_hand_gr00t_weights',
     repo_type='model',
     ignore_patterns=['**/global_step*', '**/zero_*', '**/mp_rank*'],
-    commit_message='WATO hand training — 5000 steps',
+    commit_message='WATO hand training -- 5000 steps',
 )
 print('Upload complete!')
 "
